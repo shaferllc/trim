@@ -1,17 +1,13 @@
 name: Release
 
-# Push a version tag and this builds the app, packages a .dmg, and attaches it
-# to a GitHub Release:
-#
-#   git tag v0.2 && git push origin v0.2
+# The VERSION file is the trigger. Bump it in an ordinary commit, push, and
+# this cuts the release: tag, universal build, .zip + .dmg, GitHub release.
+# Push anything that doesn't change VERSION and this job checks, finds the
+# release already exists, and stops. No bot commits, no tags to remember.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to build (e.g. 0.2) — no release is published"
-        required: true
 
 permissions:
   contents: write
@@ -21,42 +17,61 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # build-app.sh derives the build number from the history
 
-      - name: Resolve version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Read the VERSION file
+        id: v
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
 
-      - name: Build disk image
-        id: build
-        run: |
-          DMG="$(./make-dmg.sh --version '${{ steps.version.outputs.value }}' --out dist)"
-          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Trim-${{ steps.version.outputs.value }}-dmg
-          path: dist/*.dmg
-
-      - name: Publish release
-        if: github.event_name == 'push'
+      - name: Has this version already shipped?
+        id: gate
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.value }}
-          DMG: ${{ steps.build.outputs.dmg }}
         run: |
-          cat > notes.md <<'NOTES'
-          Download the `.dmg`, open it, and drag Trim to Applications.
+          if gh release view "v${{ steps.v.outputs.version }}" >/dev/null 2>&1; then
+            echo "v${{ steps.v.outputs.version }} is already released — nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v${{ steps.v.outputs.version }} is new — building."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
 
-          The app is ad-hoc signed and not notarized, so the first launch needs a
-          right-click → Open (or `xattr -dr com.apple.quarantine /Applications/Trim.app`).
-          NOTES
-          gh release create "$GITHUB_REF_NAME" "$DMG" \
-            --title "Trim $VERSION" \
-            --notes-file notes.md
+      - name: Build the universal app bundle
+        if: steps.gate.outputs.publish == 'true'
+        run: ./build-app.sh --version "${{ steps.v.outputs.version }}" --universal --dest dist
+
+      - name: Package the zip and disk image
+        if: steps.gate.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          V="${{ steps.v.outputs.version }}"
+          /usr/bin/ditto -c -k --keepParent dist/Trim.app "dist/Trim-$V.zip"
+          DMG_ROOT="$(mktemp -d)"
+          /bin/cp -R dist/Trim.app "$DMG_ROOT/Trim.app"
+          /bin/ln -s /Applications "$DMG_ROOT/Applications"
+          /usr/bin/hdiutil create -volname "Trim $V" -srcfolder "$DMG_ROOT" \
+            -fs HFS+ -format UDZO -ov -quiet "dist/Trim-$V.dmg"
+
+      - name: Verify the disk image
+        if: steps.gate.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          V="${{ steps.v.outputs.version }}"
+          # Both architectures, or the download is broken for every Intel Mac.
+          lipo -archs dist/Trim.app/Contents/MacOS/Trim | tee /dev/stderr | grep -q x86_64
+          lipo -archs dist/Trim.app/Contents/MacOS/Trim | grep -q arm64
+          hdiutil attach "dist/Trim-$V.dmg" -nobrowse -quiet -mountpoint /tmp/dmg
+          test -x /tmp/dmg/Trim.app/Contents/MacOS/Trim
+          test -L /tmp/dmg/Applications
+          hdiutil detach /tmp/dmg -quiet
+
+      - name: Publish the release
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${{ steps.v.outputs.version }}"
+          gh release create "v$V" dist/Trim-*.dmg dist/Trim-*.zip \
+            --target "$GITHUB_SHA" \
+            --title "Trim v$V" \
+            --generate-notes
